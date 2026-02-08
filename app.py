@@ -52,6 +52,14 @@ I18N = {
         "upload_label": "PDF, Image, or Word",
         "upload_btn": "Upload & Parse",
         "already_uploaded": "'{name}' already uploaded.",
+        "batch_progress": "Overall: file {cur}/{total}",
+        "file_step_convert": "Step 1/4 — Converting",
+        "file_step_ocr": "Step 2/4 — OCR Parsing",
+        "file_step_index": "Step 3/4 — Vectorizing",
+        "file_step_kg": "Step 4/4 — Knowledge Graph",
+        "file_step_done": "Done",
+        "file_step_pending": "Pending",
+        "file_step_skipped": "Skipped (duplicate)",
         "converting": "Converting '{name}'...",
         "converting_done": "'{name}' converted: {n} pages",
         "ocr_parsing": "OCR parsing '{name}' ({n} pages)...",
@@ -65,6 +73,7 @@ I18N = {
         "kg_done": "KG complete: {nodes} entities, {edges} relations",
         "kg_updated": "KG updated: {nodes} entities, {edges} relations.",
         "all_done": "'{name}' done: {pages} pages, {chunks} chunks, {nodes} entities, {edges} relations.",
+        "batch_done": "All {total} files processed.",
         "docs_header": "Documents",
         "no_docs": "No documents uploaded yet.",
         "rebuild_kg_btn": "Rebuild Knowledge Graph",
@@ -114,6 +123,14 @@ I18N = {
         "upload_label": "PDF、图片或 Word",
         "upload_btn": "上传并解析",
         "already_uploaded": "'{name}' 已上传过。",
+        "batch_progress": "总进度：第 {cur}/{total} 个文件",
+        "file_step_convert": "步骤 1/4 — 格式转换",
+        "file_step_ocr": "步骤 2/4 — OCR 解析",
+        "file_step_index": "步骤 3/4 — 向量化",
+        "file_step_kg": "步骤 4/4 — 知识图谱",
+        "file_step_done": "已完成",
+        "file_step_pending": "等待中",
+        "file_step_skipped": "已跳过（重复）",
         "converting": "正在转换 '{name}'...",
         "converting_done": "'{name}' 转换完成：{n} 页",
         "ocr_parsing": "OCR 解析 '{name}'（{n} 页）...",
@@ -127,6 +144,7 @@ I18N = {
         "kg_done": "知识图谱完成：{nodes} 个实体，{edges} 个关系",
         "kg_updated": "知识图谱已更新：{nodes} 个实体，{edges} 个关系。",
         "all_done": "'{name}' 处理完成：{pages} 页，{chunks} 个文本块，{nodes} 个实体，{edges} 个关系。",
+        "batch_done": "全部 {total} 个文件处理完成。",
         "docs_header": "已上传文档",
         "no_docs": "暂无已上传的文档。",
         "rebuild_kg_btn": "重建知识图谱",
@@ -268,91 +286,146 @@ def render_sidebar() -> None:
 
     if uploaded and st.button(t("upload_btn"), type="primary"):
         settings: Settings = st.session_state.settings
+
+        # Filter out already-uploaded files
+        new_files = []
         for f in uploaded:
             if f.name in st.session_state.uploaded_files:
                 st.info(t("already_uploaded", name=f.name))
-                continue
+            else:
+                new_files.append(f)
 
-            save_path = os.path.join(settings.upload_dir, f.name)
-            with open(save_path, "wb") as fp:
-                fp.write(f.getbuffer())
+        if not new_files:
+            pass
+        else:
+            total_files = len(new_files)
 
-            # --- Step 1: Convert ---
-            with st.status(t("converting", name=f.name), expanded=True) as status:
-                pages = st.session_state.doc_converter.convert(save_path)
-                status.update(label=t("converting_done", name=f.name, n=len(pages)), state="complete")
+            # Overall batch progress
+            batch_bar = st.progress(0, text=t("batch_progress", cur=0, total=total_files))
 
-            # --- Step 2: OCR with page-by-page progress ---
-            doc_id = uuid.uuid4().hex[:12]
-            total_pages = len(pages)
-            parsed_pages = []
+            # Create a replaceable placeholder for each file
+            file_placeholders = {}
+            for f in new_files:
+                ph = st.empty()
+                ph.markdown(f"**{f.name}** — :gray[{t('file_step_pending')}]")
+                file_placeholders[f.name] = ph
 
-            progress_bar = st.progress(0, text=t("ocr_progress", cur=0, total=total_pages, name=f.name))
-
-            for i, page in enumerate(pages):
-                progress_bar.progress(
-                    i / total_pages,
-                    text=t("ocr_progress", cur=i + 1, total=total_pages, name=f.name),
+            for file_idx, f in enumerate(new_files):
+                batch_bar.progress(
+                    file_idx / total_files,
+                    text=t("batch_progress", cur=file_idx + 1, total=total_files),
                 )
-                page_info = st.session_state.gemini_parser.parse_single_page(page, i, total_pages)
-                parsed_pages.append(page_info)
 
-            progress_bar.progress(1.0, text=t("ocr_done", name=f.name, total=total_pages))
+                save_path = os.path.join(settings.upload_dir, f.name)
+                with open(save_path, "wb") as fp:
+                    fp.write(f.getbuffer())
 
-            from hyperrag.models.schemas import ParsedDocument as PD
-            parsed = PD(
-                doc_id=doc_id,
-                filename=f.name,
-                total_pages=total_pages,
-                pages=parsed_pages,
-            )
-
-            # --- Step 3: Save ---
-            parsed_path = os.path.join(settings.parsed_dir, f"{doc_id}.json")
-            Path(parsed_path).write_text(
-                parsed.model_dump_json(indent=2), encoding="utf-8"
-            )
-
-            # --- Step 4: Index ---
-            with st.status(t("indexing", name=f.name), expanded=False) as status:
-                n = st.session_state.vector_store.add_document(parsed)
-                status.update(label=t("indexing_done", name=f.name, chunks=n), state="complete")
-
-            st.session_state.parsed_docs[doc_id] = parsed
-            st.session_state.uploaded_files[f.name] = doc_id
-            st.session_state.file_paths[doc_id] = save_path
-
-            # --- Step 5: Build KG ---
-            kg_progress = st.progress(0, text=t("kg_progress", cur=0, total=total_pages, name=f.name))
-            all_entities = []
-            all_relations = []
-            for i, page in enumerate(parsed.pages):
-                kg_progress.progress(
-                    i / total_pages,
-                    text=t("kg_progress", cur=i + 1, total=total_pages, name=f.name),
+                # Replace the pending placeholder with a live status widget
+                file_status = file_placeholders[f.name].status(
+                    f"**{f.name}** — {t('file_step_convert')}",
+                    expanded=True,
                 )
-                page_text = "\n".join(b.text for b in page.content_blocks)
-                if page_text.strip():
-                    ents, rels = st.session_state.entity_extractor._extract_from_page(
-                        doc_id=doc_id, page_num=page.page_num,
-                        page_text=page_text, page=page,
-                    )
-                    all_entities.extend(ents)
-                    all_relations.extend(rels)
 
-            all_entities = st.session_state.entity_extractor._deduplicate_entities(all_entities)
-            st.session_state.kg_store.add_entities(all_entities)
-            st.session_state.kg_store.add_relations(all_relations)
-            st.session_state.kg_built = True
+                with file_status:
+                    # --- Step 1: Convert ---
+                    st.write(t("converting", name=f.name))
+                    pages = st.session_state.doc_converter.convert(save_path)
+                    st.write(t("converting_done", name=f.name, n=len(pages)))
 
-            kg_progress.progress(1.0, text=t("kg_done",
-                                              nodes=st.session_state.kg_store.node_count(),
-                                              edges=st.session_state.kg_store.edge_count()))
+                file_status.update(
+                    label=f"**{f.name}** — {t('file_step_ocr')}",
+                    state="running",
+                )
 
-            st.success(t("all_done", name=f.name,
-                         pages=total_pages, chunks=n,
-                         nodes=st.session_state.kg_store.node_count(),
-                         edges=st.session_state.kg_store.edge_count()))
+                with file_status:
+                    # --- Step 2: OCR with page-by-page progress ---
+                    doc_id = uuid.uuid4().hex[:12]
+                    total_pages = len(pages)
+                    parsed_pages = []
+
+                    ocr_bar = st.progress(0, text=t("ocr_progress", cur=0, total=total_pages, name=f.name))
+
+                    for i, page in enumerate(pages):
+                        ocr_bar.progress(
+                            i / total_pages,
+                            text=t("ocr_progress", cur=i + 1, total=total_pages, name=f.name),
+                        )
+                        page_info = st.session_state.gemini_parser.parse_single_page(page, i, total_pages)
+                        parsed_pages.append(page_info)
+
+                    ocr_bar.progress(1.0, text=t("ocr_done", name=f.name, total=total_pages))
+
+                parsed = ParsedDocument(
+                    doc_id=doc_id,
+                    filename=f.name,
+                    total_pages=total_pages,
+                    pages=parsed_pages,
+                )
+
+                # Save parsed JSON
+                parsed_path = os.path.join(settings.parsed_dir, f"{doc_id}.json")
+                Path(parsed_path).write_text(
+                    parsed.model_dump_json(indent=2), encoding="utf-8"
+                )
+
+                file_status.update(
+                    label=f"**{f.name}** — {t('file_step_index')}",
+                    state="running",
+                )
+
+                with file_status:
+                    # --- Step 3: Vectorize / Index ---
+                    st.write(t("indexing", name=f.name))
+                    n = st.session_state.vector_store.add_document(parsed)
+                    st.write(t("indexing_done", name=f.name, chunks=n))
+
+                st.session_state.parsed_docs[doc_id] = parsed
+                st.session_state.uploaded_files[f.name] = doc_id
+                st.session_state.file_paths[doc_id] = save_path
+
+                file_status.update(
+                    label=f"**{f.name}** — {t('file_step_kg')}",
+                    state="running",
+                )
+
+                with file_status:
+                    # --- Step 4: Build KG ---
+                    kg_bar = st.progress(0, text=t("kg_progress", cur=0, total=total_pages, name=f.name))
+                    all_entities = []
+                    all_relations = []
+                    for i, page in enumerate(parsed.pages):
+                        kg_bar.progress(
+                            i / total_pages,
+                            text=t("kg_progress", cur=i + 1, total=total_pages, name=f.name),
+                        )
+                        page_text = "\n".join(b.text for b in page.content_blocks)
+                        if page_text.strip():
+                            ents, rels = st.session_state.entity_extractor._extract_from_page(
+                                doc_id=doc_id, page_num=page.page_num,
+                                page_text=page_text, page=page,
+                            )
+                            all_entities.extend(ents)
+                            all_relations.extend(rels)
+
+                    all_entities = st.session_state.entity_extractor._deduplicate_entities(all_entities)
+                    st.session_state.kg_store.add_entities(all_entities)
+                    st.session_state.kg_store.add_relations(all_relations)
+                    st.session_state.kg_built = True
+
+                    kg_bar.progress(1.0, text=t("kg_done",
+                                                 nodes=st.session_state.kg_store.node_count(),
+                                                 edges=st.session_state.kg_store.edge_count()))
+
+                # Mark file complete
+                file_status.update(
+                    label=f"**{f.name}** — {t('file_step_done')} ({total_pages}p, {n} chunks)",
+                    state="complete",
+                    expanded=False,
+                )
+
+            # Batch complete
+            batch_bar.progress(1.0, text=t("batch_done", total=total_files))
+            st.success(t("batch_done", total=total_files))
 
     # --- Document list ---
     st.divider()

@@ -1,5 +1,6 @@
 .env
 config.yaml
+.claude/
 __pycache__/
 *.pyc
 data/uploads/
