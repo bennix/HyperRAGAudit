@@ -1,0 +1,227 @@
+\chapter{Vision LLM 与结构化 OCR}
+\label{ch:vision-ocr}
+
+\section{传统 OCR 与 Vision LLM 的区别}
+
+传统 OCR 引擎（如 Tesseract\index{Tesseract}、PaddleOCR\index{PaddleOCR}）专注于字符识别，输出的是纯文本或带坐标的文字行。而 Vision LLM 的能力远超字符识别：
+
+\begin{table}[htbp]
+\centering
+\caption{传统 OCR 与 Vision LLM 的对比}
+\begin{tabular}{lp{5cm}p{5cm}}
+\toprule
+\textbf{维度} & \textbf{传统 OCR} & \textbf{Vision LLM} \\
+\midrule
+输出 & 文字行 + 字符坐标 & 结构化 JSON（文本、表格、图表描述） \\
+表格处理 & 需要额外的表格检测模型 & 直接输出 Markdown 表格 \\
+语义理解 & 无 & 能理解上下文、推断缺失信息 \\
+多语言 & 需要分别配置 & 原生多语言支持 \\
+成本 & 低（本地运行） & 较高（API 调用） \\
+速度 & 快 & 较慢（网络延迟 + 推理时间） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{提示词工程：OCR 系统提示}
+
+Vision LLM 的输出质量很大程度上取决于提示词（Prompt）的设计。HyperRAG 的 OCR 系统提示词位于 \texttt{prompts/ocr\_system.txt}：
+
+\begin{lstlisting}[language={},caption={OCR 系统提示词},basicstyle=\small\ttfamily]
+You are a high-precision document digitisation assistant.
+
+TASK: Parse the uploaded page image. Extract ALL text
+content, tables, and figures.
+
+REQUIREMENTS:
+1. For every content block, provide bounding box coordinates
+   as [y_min, x_min, y_max, x_max] normalised to a 0-1000
+   scale relative to the full image dimensions.
+2. Tables must be converted to Markdown format.
+3. Figures/charts should be described textually.
+4. Preserve the reading order of the document.
+5. Output ONLY valid JSON -- no markdown fences, no commentary.
+
+OUTPUT JSON SCHEMA:
+{
+  "content_blocks": [
+    {
+      "content_type": "text" | "table" | "figure",
+      "text": "<extracted text or markdown table>",
+      "bbox": [y_min, x_min, y_max, x_max]
+    }
+  ]
+}
+
+COORDINATE RULES:
+- y_min, x_min = top-left corner of the bounding box
+- y_max, x_max = bottom-right corner of the bounding box
+- All values are integers in the range [0, 1000]
+- (0, 0) is the top-left; (1000, 1000) is the bottom-right
+\end{lstlisting}
+
+\subsection{提示词设计要点}
+
+\begin{enumerate}
+  \item \textbf{明确输出格式}——指定 JSON Schema，减少模型"自由发挥"的空间。
+  \item \textbf{坐标约定}——明确 \texttt{[y\_min, x\_min, y\_max, x\_max]} 的顺序和范围。不同模型可能有不同的默认坐标约定，必须在提示词中显式说明。
+  \item \textbf{内容类型枚举}——限定 \texttt{text}、\texttt{table}、\texttt{figure} 三种类型，后续处理代码只需匹配这三种。
+  \item \textbf{禁止额外输出}——"Output ONLY valid JSON"防止模型在 JSON 前后添加解释性文字。
+\end{enumerate}
+
+\section{Vision API 调用}
+
+\subsection{图片编码}
+
+将 JPEG 字节编码为 base64 字符串，嵌入 OpenAI Vision API 的消息格式：
+
+\begin{lstlisting}[caption={Base64 图片编码与 API 调用}]
+import base64
+
+def _parse_page(self, page: PageImage) -> PageInfo:
+    b64 = base64.b64encode(page.png_bytes).decode("utf-8")
+
+    messages = [
+        {"role": "system", "content": self._system_prompt},
+        {"role": "user", "content": [
+            {
+                "type": "text",
+                "text": "Extract all content with bounding boxes "
+                        "from this document page.",
+            },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{b64}",
+                },
+            },
+        ]},
+    ]
+
+    resp = self._client.chat.completions.create(
+        model=self._model,
+        messages=messages,
+        max_tokens=self._max_tokens,
+        temperature=0.0,
+    )
+    raw = resp.choices[0].message.content
+    return self._parse_response(raw, page)
+\end{lstlisting}
+
+\begin{notebox}[temperature = 0.0 的重要性]
+对于 OCR 任务，我们希望输出尽可能确定性和一致性，因此将 \texttt{temperature} 设为 0.0。这意味着模型几乎总是选择概率最高的 token，减少随机性。
+\end{notebox}
+
+\subsection{MIME 类型}
+
+\texttt{data:image/jpeg;base64,\{b64\}} 中的 MIME 类型必须与实际图片格式匹配。由于我们在 DocConverter 中将所有图片转换为 JPEG，这里统一使用 \texttt{image/jpeg}。
+
+\section{响应解析}
+
+Vision LLM 的响应并不总是完美的 JSON。实践中可能遇到以下情况：
+
+\begin{enumerate}
+  \item 模型在 JSON 外面包裹了 Markdown 代码围栏（\texttt{```json ... ```}）
+  \item JSON 前后有解释性文字
+  \item BBox 坐标超出 0-1000 范围
+  \item JSON 格式错误（罕见但可能发生）
+\end{enumerate}
+
+\subsection{JSON 提取}
+
+\texttt{\_extract\_json} 方法处理前两种情况：
+
+\begin{lstlisting}[caption={从 LLM 响应中提取 JSON}]
+import re
+
+@staticmethod
+def _extract_json(text: str) -> str:
+    """Strip markdown fences and surrounding text."""
+    # 尝试匹配 ```json ... ``` 代码块
+    m = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+
+    # 回退：找到第一个 { 和最后一个 }
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1]
+
+    return text.strip()
+\end{lstlisting}
+
+\subsection{坐标钳位（Clamping）}
+
+Vision LLM 有时会返回超出 0-1000 范围的坐标（如 1040），这会导致 Pydantic 验证失败。解决方案是钳位函数：
+
+\begin{lstlisting}[caption={坐标钳位}]
+def _clamp(v: int) -> int:
+    return max(0, min(1000, v))
+
+bbox = BBox(
+    y_min=_clamp(int(bbox_list[0])),
+    x_min=_clamp(int(bbox_list[1])),
+    y_max=_clamp(int(bbox_list[2])),
+    x_max=_clamp(int(bbox_list[3])),
+)
+\end{lstlisting}
+
+\begin{warnbox}[防御性编程]
+与 LLM 交互时，永远不要假设输出格式是完美的。即使提示词要求 "only valid JSON"，模型仍可能输出非预期格式。系统的每一层都应有容错机制。
+\end{warnbox}
+
+\subsection{内容类型映射}
+
+LLM 返回的 \texttt{content\_type} 可能有意料之外的值（如 "paragraph"、"heading"），需要映射到已定义的枚举：
+
+\begin{lstlisting}[caption={容错的内容类型映射}]
+ct_raw = item.get("content_type", "text").lower()
+try:
+    ct = ContentType(ct_raw)
+except ValueError:
+    ct = ContentType.TEXT  # 未知类型回退为 text
+\end{lstlisting}
+
+\section{逐页解析与进度反馈}
+
+\texttt{parse\_single\_page} 方法将解析逻辑封装为单页粒度，便于 UI 层展示实时进度：
+
+\begin{lstlisting}[caption={逐页解析}]
+def parse_single_page(self, page: PageImage,
+                      page_idx: int, total: int) -> PageInfo:
+    t0 = time.time()
+    img_kb = len(page.png_bytes) / 1024
+    log.info(
+        f"[OCR] Page {page_idx + 1}/{total} | "
+        f"size={page.width_px}x{page.height_px} | "
+        f"image={img_kb:.0f}KB | sending to {self._model}..."
+    )
+    page_info = self._parse_page(page)
+    elapsed = time.time() - t0
+    log.info(
+        f"[OCR] Page {page_idx + 1}/{total} done "
+        f"in {elapsed:.1f}s | "
+        f"{len(page_info.content_blocks)} content blocks"
+    )
+    return page_info
+\end{lstlisting}
+
+在 Streamlit 层使用 \texttt{st.progress} 结合此方法：
+
+\begin{lstlisting}[caption={UI 进度条}]
+progress = st.progress(0, text="OCR parsing...")
+for i, page in enumerate(pages):
+    progress.progress(i / total, text=f"Page {i+1}/{total}")
+    page_info = parser.parse_single_page(page, i, total)
+    parsed_pages.append(page_info)
+progress.progress(1.0, text="OCR complete")
+\end{lstlisting}
+
+\section{性能优化策略}
+
+\begin{enumerate}
+  \item \textbf{降低 DPI}：从 300 降到 150，图片体积减少 75\%，API 传输更快。
+  \item \textbf{JPEG 压缩}：quality=75 在清晰度和体积之间取得良好平衡。
+  \item \textbf{超时与重试}：设置 \texttt{httpx.Timeout(300.0, connect=30.0)} 和 \texttt{max\_retries=3}，应对网络波动。
+  \item \textbf{模型选择}：不同 Vision 模型的速度差异巨大。可通过修改 \texttt{config.yaml} 灵活切换。
+\end{enumerate}

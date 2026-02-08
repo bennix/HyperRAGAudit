@@ -1,0 +1,224 @@
+\chapter{PDF 溯源高亮}
+\label{ch:highlighting}
+
+\section{溯源的意义}
+
+在审计工作中，"证据在哪里"与"发现了什么"同样重要。传统 RAG 系统只能返回文本片段，审计员还需要手动在原始文档中定位证据。HyperRAG 通过 PDF 高亮标注实现了\textbf{自动溯源}——点击"在 PDF 中查看"，即可看到证据在原始文档上被高亮标出。
+
+这个功能的实现依赖于一条关键的数据链路：
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=0.5cm and 1cm,
+  box/.style={rectangle, draw, rounded corners, fill=blue!8,
+    minimum width=3.5cm, minimum height=0.8cm, font=\small, align=center},
+  arrow/.style={-{Stealth[length=2mm]}, thick}
+]
+  \node[box] (v) {Vision LLM\\BBox [0-1000]};
+  \node[box, right=1.5cm of v] (s) {ChromaDB\\元数据存储};
+  \node[box, right=1.5cm of s] (a) {Agent\\AuditFinding};
+  \node[box, below=1cm of a] (c) {坐标转换\\BBox $\rightarrow$ PDFRect};
+  \node[box, left=1.5cm of c] (h) {PyMuPDF\\PDF 标注};
+
+  \draw[arrow] (v) -- (s);
+  \draw[arrow] (s) -- (a);
+  \draw[arrow] (a) -- (c);
+  \draw[arrow] (c) -- (h);
+\end{tikzpicture}
+\end{center}
+
+\section{坐标系统}
+
+系统中涉及三个不同的坐标系统：
+
+\subsection{Vision LLM 归一化坐标}
+
+Vision LLM 返回的 BBox 是归一化到 0-1000 的整数坐标：
+
+\begin{itemize}
+  \item 原点 $(0, 0)$：页面\textbf{左上角}
+  \item 终点 $(1000, 1000)$：页面\textbf{右下角}
+  \item 格式：$[\text{y\_min}, \text{x\_min}, \text{y\_max}, \text{x\_max}]$
+\end{itemize}
+
+\subsection{PDF 坐标系统}
+
+PDF 使用\textbf{点}（Point, 1 pt = 1/72 inch）作为单位，但坐标原点在\textbf{左下角}：
+
+\begin{itemize}
+  \item 原点 $(0, 0)$：页面\textbf{左下角}
+  \item $x$ 轴向右，$y$ 轴\textbf{向上}
+  \item A4 纸张尺寸：$595.28 \times 841.89$ pt
+\end{itemize}
+
+\subsection{PyMuPDF 坐标系统}
+
+PyMuPDF（fitz）使用的坐标系与 PDF 原始坐标\textbf{不同}：
+
+\begin{itemize}
+  \item 原点 $(0, 0)$：页面\textbf{左上角}
+  \item $y$ 轴\textbf{向下}（与 PDF 原始坐标相反）
+  \item 单位仍为点（pt）
+\end{itemize}
+
+\begin{notebox}[坐标系对比]
+\begin{center}
+\begin{tikzpicture}[scale=0.8]
+  % Vision LLM
+  \draw (0,0) rectangle (2.5,3.5);
+  \fill[red] (0,3.5) circle (2pt);
+  \node[above right, font=\small] at (0,3.5) {(0,0)};
+  \node[below left, font=\small] at (2.5,0) {(1000,1000)};
+  \draw[->] (0,3.5) -- (0,2.5) node[left,font=\tiny]{y};
+  \draw[->] (0,3.5) -- (1,3.5) node[above,font=\tiny]{x};
+  \node[below, font=\small\bfseries] at (1.25,-0.3) {Vision LLM};
+
+  % PyMuPDF
+  \begin{scope}[xshift=4cm]
+  \draw (0,0) rectangle (2.5,3.5);
+  \fill[blue] (0,3.5) circle (2pt);
+  \node[above right, font=\small] at (0,3.5) {(0,0)};
+  \node[below left, font=\small] at (2.5,0) {(W,H)};
+  \draw[->] (0,3.5) -- (0,2.5) node[left,font=\tiny]{y};
+  \draw[->] (0,3.5) -- (1,3.5) node[above,font=\tiny]{x};
+  \node[below, font=\small\bfseries] at (1.25,-0.3) {PyMuPDF (pt)};
+  \end{scope}
+
+  % PDF native
+  \begin{scope}[xshift=8cm]
+  \draw (0,0) rectangle (2.5,3.5);
+  \fill[green!50!black] (0,0) circle (2pt);
+  \node[below right, font=\small] at (0,0) {(0,0)};
+  \node[above left, font=\small] at (2.5,3.5) {(W,H)};
+  \draw[->] (0,0) -- (0,1) node[left,font=\tiny]{y};
+  \draw[->] (0,0) -- (1,0) node[below,font=\tiny]{x};
+  \node[below, font=\small\bfseries] at (1.25,-0.3) {PDF 原生 (pt)};
+  \end{scope}
+\end{tikzpicture}
+\end{center}
+Vision LLM 和 PyMuPDF 的坐标原点相同（左上角），$y$ 轴方向也相同（向下），因此转换相对简单。
+\end{notebox}
+
+\section{坐标转换算法}
+
+由于 Vision LLM 和 PyMuPDF 的坐标原点和 $y$ 轴方向一致，转换公式较为直接：
+
+\begin{align}
+  x_0^{\text{pdf}} &= \frac{x_\text{min}}{1000} \times W_{\text{page}} \label{eq:x0} \\
+  y_0^{\text{pdf}} &= \frac{y_\text{min}}{1000} \times H_{\text{page}} \label{eq:y0} \\
+  x_1^{\text{pdf}} &= \frac{x_\text{max}}{1000} \times W_{\text{page}} \label{eq:x1} \\
+  y_1^{\text{pdf}} &= \frac{y_\text{max}}{1000} \times H_{\text{page}} \label{eq:y1}
+\end{align}
+
+其中 $W_{\text{page}}$ 和 $H_{\text{page}}$ 是 PDF 页面的宽度和高度（单位：点）。
+
+\begin{lstlisting}[caption={坐标转换实现}]
+import fitz
+
+def gemini_bbox_to_pdf_rect(
+    bbox: BBox,
+    page: fitz.Page,
+) -> fitz.Rect:
+    """Convert normalised [0-1000] bbox to PDF Rect."""
+    pw = page.rect.width
+    ph = page.rect.height
+
+    x0 = (bbox.x_min / 1000) * pw
+    y0 = (bbox.y_min / 1000) * ph
+    x1 = (bbox.x_max / 1000) * pw
+    y1 = (bbox.y_max / 1000) * ph
+
+    return fitz.Rect(x0, y0, x1, y1)
+\end{lstlisting}
+
+\section{PDF 高亮标注}
+
+使用 PyMuPDF 的注释（Annotation）API 在 PDF 上添加高亮：
+
+\begin{lstlisting}[caption={PDF 高亮实现}]
+class PDFHighlighter:
+    def highlight(
+        self,
+        pdf_path: str,
+        locations: list[PDFRect],
+        output_path: str,
+        color: tuple = (1, 1, 0),    # 黄色
+        opacity: float = 0.35,
+    ) -> str:
+        doc = fitz.open(pdf_path)
+
+        for loc in locations:
+            if loc.page_num >= len(doc):
+                continue
+
+            page = doc[loc.page_num]
+            rect = fitz.Rect(loc.x0, loc.y0, loc.x1, loc.y1)
+
+            # 添加高亮注释
+            annot = page.add_highlight_annot(rect)
+            annot.set_colors(stroke=color)
+            annot.set_opacity(opacity)
+            annot.update()
+
+        doc.save(output_path)
+        doc.close()
+        return output_path
+\end{lstlisting}
+
+\subsection{高亮参数}
+
+\begin{description}
+  \item[color] RGB 三元组，范围 $[0, 1]$。默认 $(1, 1, 0)$ 为黄色。审计中也可使用红色 $(1, 0, 0)$ 标注高风险发现。
+  \item[opacity] 透明度，范围 $[0, 1]$。0.35 是一个折中值——既能清晰看到高亮，又不遮挡原文。
+\end{description}
+
+\section{从 AuditFinding 到高亮 PDF}
+
+完整的高亮流程：
+
+\begin{enumerate}
+  \item Agent 返回 \texttt{AuditFinding}，其中 \texttt{source\_locations} 包含一组 \texttt{PDFRect}（已转换的 PDF 物理坐标）。
+  \item UI 层调用 \texttt{PDFHighlighter.highlight()}，传入原始 PDF 路径和坐标列表。
+  \item PyMuPDF 在每个坐标位置添加高亮注释。
+  \item 高亮后的 PDF 保存到 \texttt{data/highlighted/} 目录。
+  \item UI 将高亮 PDF 以 base64 内嵌到 \texttt{<iframe>} 中显示。
+\end{enumerate}
+
+\begin{lstlisting}[caption={UI 层的高亮调用}]
+def _show_highlighted_pdf(finding):
+    for loc in finding.source_locations:
+        for doc_id, path in st.session_state.file_paths.items():
+            if path.lower().endswith(".pdf"):
+                output = os.path.join(
+                    settings.highlighted_dir,
+                    f"highlighted_{finding.finding_id}.pdf",
+                )
+                highlighter.highlight(
+                    pdf_path=path,
+                    locations=finding.source_locations,
+                    output_path=output,
+                )
+                # 显示高亮 PDF
+                pdf_bytes = Path(output).read_bytes()
+                b64 = base64.b64encode(pdf_bytes).decode()
+                st.markdown(
+                    f'<iframe src="data:application/pdf;'
+                    f'base64,{b64}" width="100%" '
+                    f'height="500"></iframe>',
+                    unsafe_allow_html=True,
+                )
+\end{lstlisting}
+
+\section{精度与误差}
+
+BBox 坐标的精度受多个因素影响：
+
+\begin{enumerate}
+  \item \textbf{Vision LLM 的坐标精度}——不同模型的坐标精度不同，通常在 $\pm20$（相当于页面尺寸的 2\%）。
+  \item \textbf{DPI 转换}——页面图片的 DPI 不影响归一化坐标，但影响 LLM 的"视觉分辨率"。
+  \item \textbf{钳位截断}——超出 0-1000 范围的坐标被钳位到边界，可能导致高亮区域偏小。
+\end{enumerate}
+
+\begin{tipbox}[实践建议]
+在实际使用中，建议对 BBox 做适当的\textbf{扩展}（如四边各扩展 10-20 个归一化单位），确保高亮区域完整覆盖目标内容，即使坐标有轻微偏差也不会遗漏。
+\end{tipbox}

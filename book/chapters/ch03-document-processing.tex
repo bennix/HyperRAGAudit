@@ -1,0 +1,177 @@
+\chapter{文档处理与转换}
+\label{ch:document-processing}
+
+\section{问题定义}
+
+企业审计中需要处理多种文档格式：PDF（最常见）、扫描件图片（PNG/JPG）、Word 文档（DOCX）。为了统一后续的 Vision LLM OCR 流程，第一步需要将所有格式转换为\textbf{标准化的页面图片}。
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=1.5cm and 1cm,
+  input/.style={rectangle, draw, fill=orange!10, minimum width=2cm, minimum height=0.8cm, font=\small},
+  process/.style={rectangle, draw, rounded corners, fill=blue!10, minimum width=3cm, minimum height=0.8cm, font=\small},
+  output/.style={rectangle, draw, fill=green!10, minimum width=2.5cm, minimum height=0.8cm, font=\small},
+  arrow/.style={-{Stealth[length=2mm]}, thick}
+]
+  \node[input] (pdf) {PDF};
+  \node[input, below=0.5cm of pdf] (img) {PNG / JPG};
+  \node[input, below=0.5cm of img] (docx) {DOCX};
+  \node[process, right=2cm of img] (conv) {DocConverter};
+  \node[output, right=2cm of conv] (out) {List[PageImage]\\JPEG bytes};
+
+  \draw[arrow] (pdf.east) -- (conv.west);
+  \draw[arrow] (img.east) -- (conv.west);
+  \draw[arrow] (docx.east) -- (conv.west);
+  \draw[arrow] (conv) -- (out);
+\end{tikzpicture}
+\end{center}
+
+\section{PageImage 数据结构}
+
+每个页面转换后的结果封装为 \texttt{PageImage} 数据类：
+
+\begin{lstlisting}[caption={PageImage 定义}]
+@dataclass
+class PageImage:
+    page_num: int       # 页码（0-based）
+    png_bytes: bytes    # 实际为 JPEG 字节（历史命名）
+    width_px: int       # 图片宽度（像素）
+    height_px: int      # 图片高度（像素）
+\end{lstlisting}
+
+\section{PDF 转换：PyMuPDF}
+
+PDF 是审计文档的主要格式。使用 PyMuPDF\index{PyMuPDF}（即 \texttt{fitz}）库将 PDF 的每一页渲染为图片。
+
+\subsection{渲染流程}
+
+\begin{lstlisting}[caption={PDF 页面渲染}]
+import fitz  # PyMuPDF
+
+def _convert_pdf(self, path: str) -> list[PageImage]:
+    doc = fitz.open(path)
+    pages = []
+    for i, page in enumerate(doc):
+        # DPI 转换矩阵：72 dpi -> 目标 dpi
+        mat = fitz.Matrix(self._dpi / 72, self._dpi / 72)
+        pix = page.get_pixmap(matrix=mat)
+
+        # Pixmap -> JPEG bytes
+        jpeg_bytes = self._to_jpeg_bytes(pix)
+
+        pages.append(PageImage(
+            page_num=i,
+            png_bytes=jpeg_bytes,
+            width_px=pix.width,
+            height_px=pix.height,
+        ))
+    doc.close()
+    return pages
+\end{lstlisting}
+
+\subsection{DPI 与图片质量}
+
+\begin{notebox}[DPI 选择的权衡]
+DPI（Dots Per Inch）决定了渲染精度与文件大小的平衡：
+\begin{itemize}
+  \item \textbf{72 dpi}：PDF 原始分辨率，文件小但文字可能模糊
+  \item \textbf{150 dpi}（推荐）：清晰度足够 OCR 识别，文件大小适中
+  \item \textbf{300 dpi}：高清晰度，但文件体积是 150 dpi 的 4 倍
+\end{itemize}
+在实际测试中，300 dpi 的大图片会导致 API 传输超时（SSL 连接中断），因此 HyperRAG 默认使用 150 dpi。
+\end{notebox}
+
+\subsection{JPEG 压缩}
+
+为了进一步减小传输体积，将 PyMuPDF 的 Pixmap（RGB 原始像素）转换为 JPEG 格式：
+
+\begin{lstlisting}[caption={Pixmap 转 JPEG}]
+from PIL import Image
+import io
+
+def _to_jpeg_bytes(self, pix) -> bytes:
+    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=self._jpeg_quality)
+    return buf.getvalue()
+\end{lstlisting}
+
+\begin{table}[htbp]
+\centering
+\caption{不同压缩参数对 A4 页面的影响}
+\label{tab:compression}
+\begin{tabular}{lcc}
+\toprule
+\textbf{配置} & \textbf{文件大小} & \textbf{OCR 准确率} \\
+\midrule
+PNG @ 300 dpi & $\sim$2-5 MB & 最高 \\
+JPEG 75 @ 150 dpi & $\sim$100-300 KB & 高 \\
+JPEG 50 @ 100 dpi & $\sim$30-80 KB & 中等 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{图片处理：PIL}
+
+对于直接上传的图片文件（PNG/JPG），处理相对简单：
+
+\begin{lstlisting}[caption={图片文件处理}]
+def _convert_image(self, path: str) -> list[PageImage]:
+    img = Image.open(path).convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=self._jpeg_quality)
+    return [PageImage(
+        page_num=0,
+        png_bytes=buf.getvalue(),
+        width_px=img.width,
+        height_px=img.height,
+    )]
+\end{lstlisting}
+
+图片文件只有一"页"，因此返回包含单个 \texttt{PageImage} 的列表。
+
+\section{Word 文档：python-docx}
+
+DOCX 格式\index{DOCX}是结构化的 XML 文档，不需要 OCR 即可直接提取文本。python-docx 库提供了段落级别的访问：
+
+\begin{lstlisting}[caption={DOCX 文本提取}]
+from docx import Document
+
+def _convert_docx(self, path: str) -> list[PageImage]:
+    doc = Document(path)
+    full_text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+    # 将文本渲染为图片（简化处理）
+    # 实际实现中，DOCX 的文本直接参与索引，
+    # 图片仅用于 UI 预览
+    ...
+\end{lstlisting}
+
+\begin{warnbox}[DOCX 的局限性]
+python-docx 只能提取文本段落，对于 DOCX 中嵌入的图片、复杂表格，提取能力有限。如果 DOCX 包含大量视觉元素，建议先将其导出为 PDF 再处理。
+\end{warnbox}
+
+\section{统一入口：convert 方法}
+
+\texttt{DocConverter.convert()} 方法根据文件扩展名自动选择转换策略：
+
+\begin{lstlisting}[caption={统一转换入口}]
+def convert(self, file_path: str) -> list[PageImage]:
+    ext = Path(file_path).suffix.lower()
+    if ext == ".pdf":
+        return self._convert_pdf(file_path)
+    elif ext in (".png", ".jpg", ".jpeg"):
+        return self._convert_image(file_path)
+    elif ext == ".docx":
+        return self._convert_docx(file_path)
+    else:
+        raise ValueError(f"Unsupported file type: {ext}")
+\end{lstlisting}
+
+\section{实践要点}
+
+\begin{enumerate}
+  \item \textbf{内存管理}：处理大 PDF（数百页）时，应逐页渲染而非一次性加载所有页面到内存中。HyperRAG 使用 \texttt{for page in doc} 迭代器模式。
+  \item \textbf{错误处理}：损坏的 PDF 或不支持的加密格式会导致 PyMuPDF 抛出异常，应在 UI 层捕获并提示用户。
+  \item \textbf{临时文件}：转换后的 JPEG 字节直接存在内存中（\texttt{PageImage.png\_bytes}），不写入磁盘，避免临时文件管理问题。
+  \item \textbf{尺寸记录}：\texttt{width\_px} 和 \texttt{height\_px} 在后续 BBox 坐标转换中至关重要——Vision LLM 返回的坐标是相对于这个图片尺寸的。
+\end{enumerate}

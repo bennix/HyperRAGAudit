@@ -1,0 +1,250 @@
+\chapter{Streamlit Web 界面}
+\label{ch:web-ui}
+
+\section{为什么选择 Streamlit}
+
+构建 RAG 系统的 Web 界面有多种选择：
+
+\begin{table}[htbp]
+\centering
+\caption{Web 框架对比}
+\begin{tabular}{lp{4cm}p{4cm}}
+\toprule
+\textbf{框架} & \textbf{优势} & \textbf{劣势} \\
+\midrule
+Streamlit & 纯 Python，快速原型，内置组件丰富 & 定制性有限，不适合复杂交互 \\
+Gradio & 专为 ML Demo 设计，简单易用 & 布局灵活性差 \\
+Flask + React & 完全自定义，前后端分离 & 开发成本高 \\
+FastAPI + Vue & 高性能 API，现代前端 & 技术栈复杂 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+对于 HyperRAG 这类数据分析导向的应用，Streamlit\index{Streamlit} 是最佳选择：
+
+\begin{itemize}
+  \item 100\% Python，无需前端开发经验
+  \item 内置文件上传、进度条、表格、PDF 嵌入等组件
+  \item \texttt{st.session\_state} 自动管理应用状态
+  \item 修改代码后自动刷新，开发效率极高
+\end{itemize}
+
+\section{应用结构}
+
+HyperRAG 的 Streamlit 应用采用\textbf{侧边栏 + 三 Tab} 的布局：
+
+\begin{lstlisting}[caption={应用主框架}]
+def main() -> None:
+    st.set_page_config(
+        page_title="HyperRAG Audit",
+        layout="wide",
+    )
+    _init_session_state()
+
+    with st.sidebar:
+        render_sidebar()
+
+    tab_docs, tab_audit, tab_graph = st.tabs(
+        [t("tab_docs"), t("tab_audit"), t("tab_graph")]
+    )
+
+    with tab_docs:
+        render_document_view()
+    with tab_audit:
+        render_audit_query()
+    with tab_graph:
+        render_knowledge_graph()
+\end{lstlisting}
+
+\begin{description}
+  \item[侧边栏] 语言切换、文件上传、已上传文档列表、重建知识图谱按钮
+  \item[Tab 1: 文档预览] 原始 PDF 与解析内容的双栏对比
+  \item[Tab 2: 审计查询] 查询输入、Agent 推理过程、审计发现与 PDF 高亮
+  \item[Tab 3: 知识图谱] 交互式图谱可视化、实体搜索与过滤
+\end{description}
+
+\section{Session State 管理}
+
+Streamlit 的每次用户交互都会重新执行整个脚本。为了在交互之间保持状态，使用 \texttt{st.session\_state}：
+
+\begin{lstlisting}[caption={Session State 初始化}]
+def _init_session_state() -> None:
+    if "initialised" in st.session_state:
+        return  # 已初始化，跳过
+
+    settings = Settings()
+
+    # 创建所有服务实例
+    factory = LLMClientFactory(
+        api_key=settings.zenmux_api_key,
+        base_url=settings.zenmux_base_url,
+    )
+    st.session_state.settings = settings
+    st.session_state.factory = factory
+    st.session_state.openai_client = factory.get_openai_client()
+    st.session_state.claude_llm = factory.get_langchain_llm(
+        model=settings.claude_model,
+    )
+    st.session_state.doc_converter = DocConverter(...)
+    st.session_state.gemini_parser = GeminiParser(...)
+    st.session_state.vector_store = VectorStore(...)
+    st.session_state.kg_store = KnowledgeGraphStore()
+    ...
+
+    st.session_state.parsed_docs = {}   # doc_id -> ParsedDocument
+    st.session_state.uploaded_files = {}  # filename -> doc_id
+    st.session_state.file_paths = {}      # doc_id -> file path
+    st.session_state.kg_built = False
+
+    st.session_state.initialised = True
+\end{lstlisting}
+
+\begin{notebox}[初始化守卫模式]
+\texttt{if "initialised" in st.session\_state: return} 这个模式确保了昂贵的初始化操作（如创建数据库连接、加载配置）只执行一次。每次用户点击按钮或切换 Tab 时，脚本重新执行但会跳过初始化。
+\end{notebox}
+
+\section{文件上传与处理流程}
+
+上传流程是应用中最复杂的部分，涉及多个异步步骤和进度反馈：
+
+\begin{lstlisting}[caption={上传处理流程}]
+if uploaded and st.button(t("upload_btn"), type="primary"):
+    for f in uploaded:
+        # Step 1: 保存文件
+        save_path = os.path.join(settings.upload_dir, f.name)
+        with open(save_path, "wb") as fp:
+            fp.write(f.getbuffer())
+
+        # Step 2: 转换为页面图片
+        with st.status(t("converting", name=f.name)):
+            pages = doc_converter.convert(save_path)
+
+        # Step 3: 逐页 OCR（带进度条）
+        progress = st.progress(0, text="OCR...")
+        parsed_pages = []
+        for i, page in enumerate(pages):
+            progress.progress(i / total,
+                text=t("ocr_progress", cur=i+1, total=total))
+            page_info = parser.parse_single_page(page, i, total)
+            parsed_pages.append(page_info)
+        progress.progress(1.0, text=t("ocr_done"))
+
+        # Step 4: 向量索引
+        n = vector_store.add_document(parsed)
+
+        # Step 5: 知识图谱构建（带进度条）
+        kg_progress = st.progress(0, text="KG...")
+        for i, page in enumerate(parsed.pages):
+            kg_progress.progress(i / total, ...)
+            ents, rels = extractor._extract_from_page(...)
+            ...
+        kg_progress.progress(1.0)
+\end{lstlisting}
+
+\subsection{进度反馈设计}
+
+HyperRAG 使用两种进度反馈机制：
+
+\begin{enumerate}
+  \item \textbf{st.status}——用于简短的同步操作（如文件转换），显示为可展开的状态卡片。
+  \item \textbf{st.progress}——用于逐页处理的长操作（如 OCR 和 KG 构建），显示为进度条并实时更新文本。
+\end{enumerate}
+
+\section{国际化（i18n）}
+
+HyperRAG 支持中英文切换，采用字典映射方案：
+
+\begin{lstlisting}[caption={i18n 实现}]
+I18N = {
+    "en": {
+        "page_title": "HyperRAG Audit",
+        "upload_header": "Upload Documents",
+        "upload_btn": "Upload & Parse",
+        ...
+    },
+    "zh": {
+        "page_title": "HyperRAG 智能审计",
+        "upload_header": "上传文档",
+        "upload_btn": "上传并解析",
+        ...
+    },
+}
+
+def t(key: str, **kwargs) -> str:
+    """Get translated string for current language."""
+    lang = st.session_state.get("lang", "zh")
+    text = I18N.get(lang, I18N["en"]).get(key, key)
+    if kwargs:
+        text = text.format(**kwargs)
+    return text
+\end{lstlisting}
+
+\texttt{t()} 函数支持参数插值：\texttt{t("ocr\_progress", cur=3, total=10)} 会渲染为 "OCR: 正在解析第 3/10 页..."。
+
+\section{知识图谱可视化}
+
+使用 \texttt{streamlit-agraph}\index{streamlit-agraph} 库实现交互式图谱：
+
+\begin{lstlisting}[caption={知识图谱可视化}]
+from streamlit_agraph import agraph, Node, Edge, Config
+
+# 为每个实体类型定义颜色
+type_colors = {
+    "Person": "#2e7d32",
+    "Company": "#1565c0",
+    "Amount": "#e65100",
+    ...
+}
+
+# 使用数值 ID 避免 CJK 字符的 URL 编码问题
+name_to_id = {n["name"]: f"n{i}" for i, n in enumerate(nodes_data)}
+
+nodes = [
+    Node(
+        id=name_to_id[n["name"]],
+        label=n["name"][:20],  # 截断长标签
+        size=25,
+        color=type_colors.get(n.get("entity_type"), "#999"),
+        title=f'{n.get("entity_type")}: {n["name"]}',
+    )
+    for n in nodes_data
+]
+
+edges = [
+    Edge(
+        source=name_to_id[e["source"]],
+        target=name_to_id[e["target"]],
+        label=e.get("relation_type", ""),
+    )
+    for e in edges_data
+]
+
+config = Config(
+    width=900, height=500,
+    directed=True, physics=True,
+)
+agraph(nodes=nodes, edges=edges, config=config)
+\end{lstlisting}
+
+\begin{warnbox}[CJK 字符的坑]
+\texttt{streamlit-agraph} 内部将节点 ID 用于 URL 路径。如果 ID 包含中文字符，会导致 \texttt{FileNotFoundError}。解决方案是使用数值 ID（如 \texttt{n0}, \texttt{n1}），将中文名称放在 \texttt{label} 和 \texttt{title} 属性中。
+\end{warnbox}
+
+\section{PDF 内嵌显示}
+
+Streamlit 没有原生的 PDF 查看器组件，使用 HTML \texttt{<iframe>} 内嵌 base64 编码的 PDF：
+
+\begin{lstlisting}[caption={PDF 内嵌显示}]
+pdf_bytes = Path(file_path).read_bytes()
+b64 = base64.b64encode(pdf_bytes).decode()
+pdf_html = (
+    f'<iframe src="data:application/pdf;base64,{b64}" '
+    f'width="100%" height="600" '
+    f'type="application/pdf"></iframe>'
+)
+st.markdown(pdf_html, unsafe_allow_html=True)
+\end{lstlisting}
+
+\begin{tipbox}[unsafe\_allow\_html]
+\texttt{unsafe\_allow\_html=True} 允许注入原始 HTML。仅在你完全控制 HTML 内容时使用。不要将用户输入直接拼入 HTML 字符串，防止 XSS 攻击。
+\end{tipbox}

@@ -1,0 +1,256 @@
+\chapter{LangGraph 审计 Agent}
+\label{ch:agent}
+
+\section{什么是 Agent}
+
+在 LLM 应用中，Agent\index{Agent} 是一个能够\textbf{自主决定使用哪些工具、以何种顺序执行}的智能体。与简单的"用户提问 $\rightarrow$ 检索 $\rightarrow$ 生成回答"流程不同，Agent 可以：
+
+\begin{enumerate}
+  \item 分析用户问题，决定需要哪些信息
+  \item 调用工具获取信息
+  \item 分析工具返回的结果
+  \item 决定是否需要更多信息（再次调用工具）
+  \item 最终综合所有信息生成回答
+\end{enumerate}
+
+这种多步推理能力对审计场景至关重要——审计员不会只看一个文档片段就下结论，而是会交叉查证多个信息来源。
+
+\section{ReAct 模式}
+
+ReAct\index{ReAct}（Reasoning + Acting）是目前最流行的 Agent 架构模式。它让 LLM 在每一步交替进行\textbf{思考}（Reasoning）和\textbf{行动}（Acting）：
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=1cm,
+  think/.style={rectangle, draw, rounded corners, fill=yellow!15,
+    minimum width=4cm, minimum height=0.8cm, font=\small},
+  act/.style={rectangle, draw, rounded corners, fill=blue!10,
+    minimum width=4cm, minimum height=0.8cm, font=\small},
+  obs/.style={rectangle, draw, rounded corners, fill=green!10,
+    minimum width=4cm, minimum height=0.8cm, font=\small},
+  arrow/.style={-{Stealth[length=2mm]}, thick}
+]
+  \node[think] (t1) {Thought: 需要查找合同金额};
+  \node[act, below=of t1] (a1) {Action: search\_documents("合同金额")};
+  \node[obs, below=of a1] (o1) {Observation: 找到 3 个相关片段...};
+  \node[think, below=of o1] (t2) {Thought: 需要对比发票金额};
+  \node[act, below=of t2] (a2) {Action: query\_knowledge\_graph("发票")};
+  \node[obs, below=of a2] (o2) {Observation: 发票关联实体...};
+  \node[think, below=of o2] (t3) {Thought: 发现金额不一致，生成报告};
+
+  \draw[arrow] (t1) -- (a1);
+  \draw[arrow] (a1) -- (o1);
+  \draw[arrow] (o1) -- (t2);
+  \draw[arrow] (t2) -- (a2);
+  \draw[arrow] (a2) -- (o2);
+  \draw[arrow] (o2) -- (t3);
+\end{tikzpicture}
+\end{center}
+
+\section{LangGraph 框架}
+
+LangGraph\index{LangGraph} 是 LangChain 团队开发的 Agent 框架，基于图（Graph）的概念组织 Agent 的执行流程。
+
+\subsection{为什么选择 LangGraph}
+
+\begin{itemize}
+  \item \textbf{原生 ReAct 支持}——\texttt{create\_react\_agent} 一行代码即可创建完整的 ReAct Agent
+  \item \textbf{流式输出}——原生支持流式返回中间步骤，适合 UI 实时显示推理过程
+  \item \textbf{状态管理}——自动管理对话历史和工具调用状态
+  \item \textbf{可扩展}——可以轻松添加自定义节点和边
+\end{itemize}
+
+\subsection{Agent 创建}
+
+\begin{lstlisting}[caption={创建 ReAct Agent}]
+from langgraph.prebuilt import create_react_agent
+
+class AuditAgent:
+    def __init__(self, llm, tools, prompts_dir, max_iterations):
+        self._system_prompt = self._load_prompt(prompts_dir)
+        self._max_iterations = max_iterations
+
+        self._agent = create_react_agent(
+            model=llm,
+            tools=tools,
+            prompt=self._system_prompt,
+        )
+\end{lstlisting}
+
+\section{工具设计}
+
+Agent 的能力由其可用工具决定。HyperRAG 为审计 Agent 设计了 5 个专用工具：
+
+\subsection{工具清单}
+
+\begin{table}[htbp]
+\centering
+\caption{Agent 工具清单}
+\begin{tabular}{lp{8cm}}
+\toprule
+\textbf{工具名称} & \textbf{功能} \\
+\midrule
+\texttt{search\_documents} & 在向量数据库中进行语义搜索，返回最相关的文档片段及其 BBox \\
+\texttt{query\_knowledge\_graph} & 查询知识图谱中某个实体的邻居节点和关系 \\
+\texttt{query\_graph\_path} & 查询两个实体之间的连接路径 \\
+\texttt{get\_page\_content} & 获取指定文档的指定页面的完整内容 \\
+\texttt{list\_entities\_by\_type} & 列出知识图谱中某类型的所有实体 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{工具实现示例}
+
+使用 LangChain 的 \texttt{@tool} 装饰器定义工具：
+
+\begin{lstlisting}[caption={search\_documents 工具}]
+from langchain_core.tools import tool
+
+def create_tools(vector_store, kg_store, parsed_docs):
+
+    @tool
+    def search_documents(query: str) -> str:
+        """Search documents by semantic similarity.
+        Returns relevant text chunks with source info."""
+        results = vector_store.search(query, top_k=5)
+        if not results:
+            return "No relevant documents found."
+        output = []
+        for r in results:
+            output.append(
+                f"[Doc:{r.doc_id} Page:{r.page_num+1} "
+                f"Score:{r.score:.2f}]\n{r.text[:500]}"
+            )
+        return "\n---\n".join(output)
+
+    @tool
+    def query_knowledge_graph(entity_name: str) -> str:
+        """Query the knowledge graph for an entity's
+        relationships and neighbors."""
+        result = kg_store.query_neighbors(
+            entity_name, depth=2
+        )
+        if not result["nodes"]:
+            return f"Entity '{entity_name}' not found."
+        return json.dumps(result, ensure_ascii=False,
+                          indent=2)
+
+    ...
+    return [search_documents, query_knowledge_graph,
+            query_graph_path, get_page_content,
+            list_entities_by_type]
+\end{lstlisting}
+
+\begin{notebox}[工具 Docstring 的重要性]
+LLM 通过工具的 \textbf{docstring}（函数文档字符串）来理解工具的用途和使用方式。一个好的 docstring 应该：
+\begin{itemize}
+  \item 清晰描述工具的功能
+  \item 说明输入参数的含义
+  \item 描述返回值的格式
+\end{itemize}
+LLM 会根据 docstring 决定何时使用哪个工具以及传入什么参数。
+\end{notebox}
+
+\subsection{工厂模式}
+
+工具通过 \texttt{create\_tools} 工厂函数创建，接收依赖项作为参数。这种模式的优势：
+
+\begin{enumerate}
+  \item \textbf{依赖注入}——工具函数通过闭包访问 \texttt{vector\_store}、\texttt{kg\_store} 等对象，不依赖全局变量。
+  \item \textbf{可测试性}——单元测试可以传入 mock 对象。
+  \item \textbf{解耦}——工具定义与存储实现分离。
+\end{enumerate}
+
+\section{流式推理}
+
+审计查询的推理过程可能持续数十秒，为了让用户了解 Agent 的工作进展，使用流式输出：
+
+\begin{lstlisting}[caption={流式推理输出}]
+def stream(self, query: str):
+    """Yield reasoning steps as they happen."""
+    inputs = {"messages": [("user", query)]}
+    config = {"recursion_limit": self._max_iterations * 2}
+
+    for event in self._agent.stream(inputs, config):
+        for node_name, node_output in event.items():
+            messages = node_output.get("messages", [])
+            for msg in messages:
+                if hasattr(msg, "tool_calls") and msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        yield {
+                            "type": "tool_call",
+                            "content": f"{tc['name']}({tc['args']})"
+                        }
+                elif hasattr(msg, "content") and msg.content:
+                    if msg.type == "tool":
+                        yield {
+                            "type": "tool_result",
+                            "content": msg.content[:500]
+                        }
+                    else:
+                        yield {
+                            "type": "thinking",
+                            "content": msg.content
+                        }
+\end{lstlisting}
+
+在 Streamlit 中，每个 yield 的步骤会实时显示在界面上，用户可以看到 Agent 正在调用哪个工具、获取了什么结果。
+
+\section{审计报告生成}
+
+Agent 的最终输出是一个结构化的审计报告：
+
+\begin{lstlisting}[language=json,caption={审计报告 JSON 结构}]
+{
+  "findings": [
+    {
+      "finding_id": "F001",
+      "description": "合同金额与发票总额不一致",
+      "severity": "high",
+      "evidence": [
+        "合同 HW-2024-001 金额为 500 万元",
+        "对应发票总额为 520 万元"
+      ],
+      "source_pages": [
+        {"doc_id": "abc123", "page_num": 3}
+      ],
+      "related_entities": ["HW-2024-001", "500万元"]
+    }
+  ],
+  "summary": "发现 1 项高风险问题..."
+}
+\end{lstlisting}
+
+\subsection{报告解析}
+
+与 OCR 响应类似，Agent 输出的 JSON 也需要容错解析：
+
+\begin{lstlisting}[caption={报告解析}]
+def _parse_report(self, query: str, content: str):
+    cleaned = self._extract_json(content)
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        return AuditReport(
+            query=query,
+            findings=[],
+            summary=content,  # 回退：将原文作为摘要
+        )
+    # 构建 AuditReport...
+\end{lstlisting}
+
+\section{Agent 系统提示词}
+
+位于 \texttt{prompts/audit\_system.txt} 的系统提示词定义了 Agent 的角色和行为准则：
+
+\begin{enumerate}
+  \item \textbf{角色定义}——"You are an expert financial and compliance auditor AI assistant"
+  \item \textbf{工具说明}——列出所有可用工具及其用途
+  \item \textbf{工作流程}——理解 $\rightarrow$ 搜索 $\rightarrow$ 交叉验证 $\rightarrow$ 识别异常 $\rightarrow$ 生成报告
+  \item \textbf{输出格式}——JSON Schema 定义
+  \item \textbf{行为规则}——引用具体页码、分级严重程度、不捏造证据
+\end{enumerate}
+
+\begin{tipbox}[迭代次数限制]
+\texttt{max\_iterations} 限制了 Agent 的最大推理步数（默认 10 步）。这是一个安全阀——防止 Agent 陷入无限循环。在实践中，大多数审计查询在 3-6 步内完成。
+\end{tipbox}

@@ -1,0 +1,179 @@
+\chapter{向量数据库与语义检索}
+\label{ch:vector-database}
+
+\section{为什么需要向量数据库}
+
+传统的关键词搜索（如 SQL \texttt{LIKE} 或全文索引）只能匹配字面相同的词语。而在审计场景中，用户的提问方式千变万化：
+
+\begin{itemize}
+  \item 用户问"付款金额"，文档中写的是"交易总额"
+  \item 用户问"签约方"，文档中写的是"甲方"
+  \item 用户问"违规行为"，文档中描述的是具体操作细节
+\end{itemize}
+
+向量数据库\index{向量数据库}通过\textbf{语义相似度}而非字面匹配来检索，解决了这个问题。
+
+\section{Embedding 原理}
+
+\subsection{什么是 Embedding}
+
+Embedding（嵌入）\index{Embedding}是将文本映射到高维向量空间的过程。在这个空间中，语义相近的文本对应的向量也相近：
+
+\begin{center}
+\begin{tikzpicture}[scale=1.5]
+  \draw[->] (0,0) -- (3,0) node[right] {维度 1};
+  \draw[->] (0,0) -- (0,2.5) node[above] {维度 2};
+
+  \fill[red] (1.0, 2.0) circle (2pt) node[right, font=\small] {合同金额};
+  \fill[red] (1.2, 1.8) circle (2pt) node[right, font=\small] {交易总额};
+  \fill[blue] (2.5, 0.5) circle (2pt) node[right, font=\small] {签约日期};
+  \fill[blue] (2.3, 0.7) circle (2pt) node[left, font=\small] {合同日期};
+
+  \draw[<->, dashed, red!60] (1.0, 2.0) -- (1.2, 1.8);
+  \draw[<->, dashed, blue!60] (2.5, 0.5) -- (2.3, 0.7);
+\end{tikzpicture}
+\end{center}
+
+实际的 Embedding 向量通常有 768 或 1536 个维度，上图仅为 2D 示意。
+
+\subsection{余弦相似度}
+
+两个向量的相似度通常用\textbf{余弦相似度}（Cosine Similarity）\index{余弦相似度}计算：
+
+\[
+  \text{sim}(\mathbf{a}, \mathbf{b}) = \frac{\mathbf{a} \cdot \mathbf{b}}{|\mathbf{a}| \cdot |\mathbf{b}|}
+\]
+
+值域为 $[-1, 1]$，1 表示完全相同，0 表示不相关，$-1$ 表示完全相反。ChromaDB 默认使用余弦相似度进行检索。
+
+\section{ChromaDB 基础}
+
+ChromaDB\index{ChromaDB} 是一个嵌入式向量数据库，特点包括：
+
+\begin{itemize}
+  \item \textbf{零配置}——不需要单独部署服务器，直接嵌入 Python 进程
+  \item \textbf{持久化}——使用 \texttt{PersistentClient}，数据存储在本地磁盘
+  \item \textbf{内置 Embedding}——默认使用 \texttt{all-MiniLM-L6-v2} 模型
+  \item \textbf{元数据过滤}——支持在向量搜索的同时按元数据字段过滤
+\end{itemize}
+
+\subsection{初始化}
+
+\begin{lstlisting}[caption={ChromaDB 初始化}]
+import chromadb
+from chromadb.config import Settings as ChromaSettings
+
+class VectorStore:
+    def __init__(self, persist_dir: str, collection_name: str):
+        self._client = chromadb.PersistentClient(
+            path=persist_dir,
+            settings=ChromaSettings(
+                anonymized_telemetry=False,  # 关闭遥测
+            ),
+        )
+        self._collection = self._client.get_or_create_collection(
+            name=collection_name,
+            metadata={"hnsw:space": "cosine"},
+        )
+\end{lstlisting}
+
+\begin{tipbox}[关闭遥测]
+ChromaDB 默认发送匿名使用数据。在某些环境中，遥测的 HTTP 请求可能因依赖版本不兼容（如 posthog 库）而抛出异常。建议在生产环境中始终设置 \texttt{anonymized\_telemetry=False}。
+\end{tipbox}
+
+\section{文档索引}
+
+将 \texttt{ParsedDocument} 的所有内容块索引到 ChromaDB：
+
+\begin{lstlisting}[caption={文档索引实现}]
+def add_document(self, doc: ParsedDocument) -> int:
+    ids, documents, metadatas = [], [], []
+
+    for page in doc.pages:
+        for j, block in enumerate(page.content_blocks):
+            chunk_id = f"{doc.doc_id}_p{page.page_num}_b{j}"
+
+            ids.append(chunk_id)
+            documents.append(block.text)
+            metadatas.append({
+                "doc_id": doc.doc_id,
+                "filename": doc.filename,
+                "page_num": page.page_num,
+                "content_type": block.content_type.value,
+                "bbox_json": block.bbox.model_dump_json(),
+            })
+
+    if ids:
+        self._collection.add(
+            ids=ids,
+            documents=documents,
+            metadatas=metadatas,
+        )
+    return len(ids)
+\end{lstlisting}
+
+\subsection{关键设计决策}
+
+\begin{description}
+  \item[Chunk ID 设计] 格式为 \texttt{doc\_id\_pN\_bM}，确保全局唯一且可追溯到具体文档、页面、块。
+  \item[BBox 元数据] 将 BBox 序列化为 JSON 字符串存入 \texttt{bbox\_json} 字段。ChromaDB 的元数据只支持基本类型（str/int/float），不支持嵌套对象。
+  \item[不做额外分块] 每个 ContentBlock 就是一个 chunk。因为 Vision LLM 已经按语义单元（段落、表格、图表）做了分块，不需要再做文本切分。
+\end{description}
+
+\section{语义检索}
+
+\begin{lstlisting}[caption={语义检索实现}]
+def search(self, query: str, top_k: int = 5) -> list[RetrievalResult]:
+    results = self._collection.query(
+        query_texts=[query],
+        n_results=top_k,
+    )
+
+    retrieval_results = []
+    for i in range(len(results["ids"][0])):
+        meta = results["metadatas"][0][i]
+        bbox = None
+        if "bbox_json" in meta:
+            bbox = BBox.model_validate_json(meta["bbox_json"])
+
+        retrieval_results.append(RetrievalResult(
+            text=results["documents"][0][i],
+            doc_id=meta["doc_id"],
+            page_num=meta["page_num"],
+            content_type=meta.get("content_type", "text"),
+            bbox=bbox,
+            score=1 - results["distances"][0][i],
+        ))
+    return retrieval_results
+\end{lstlisting}
+
+\begin{notebox}[距离与相似度的转换]
+ChromaDB 返回的是\textbf{距离}（distance），而我们通常需要的是\textbf{相似度}（similarity）。对于余弦距离：
+\[
+  \text{similarity} = 1 - \text{distance}
+\]
+距离为 0 表示完全相同（相似度 = 1），距离为 2 表示完全相反（相似度 = -1）。
+\end{notebox}
+
+\section{BBox 的全链路传播}
+
+HyperRAG 的一个核心设计理念是 \textbf{BBox 坐标贯穿整个管道}：
+
+\begin{enumerate}
+  \item \textbf{OCR 阶段}：Vision LLM 为每个内容块生成 BBox $\rightarrow$ 存入 \texttt{ContentBlock.bbox}
+  \item \textbf{索引阶段}：BBox 序列化为 JSON $\rightarrow$ 存入 ChromaDB 元数据
+  \item \textbf{检索阶段}：从元数据反序列化 BBox $\rightarrow$ 返回 \texttt{RetrievalResult.bbox}
+  \item \textbf{Agent 阶段}：Agent 工具返回带 BBox 的检索结果 $\rightarrow$ 写入 \texttt{AuditFinding}
+  \item \textbf{高亮阶段}：BBox 转换为 PDF 物理坐标 $\rightarrow$ 标注在原始 PDF 上
+\end{enumerate}
+
+这条链路确保了最终的审计发现可以精确追溯到原始文档的具体位置。
+
+\section{实践要点}
+
+\begin{enumerate}
+  \item \textbf{幂等性}：\texttt{add\_document} 使用确定性 ID，重复添加同一文档不会产生重复记录（ChromaDB 的 upsert 语义）。
+  \item \textbf{Collection 管理}：每个项目使用独立的 collection name，避免不同项目的数据互相污染。
+  \item \textbf{Embedding 模型}：ChromaDB 默认使用 \texttt{all-MiniLM-L6-v2}，首次运行会自动下载。如需更高质量的 Embedding，可配置其他模型。
+  \item \textbf{检索数量}：\texttt{top\_k} 默认为 5，在审计场景中建议设为 5-10。过多会引入噪声，过少可能遗漏关键信息。
+\end{enumerate}
