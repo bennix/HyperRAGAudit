@@ -1,0 +1,40 @@
+# ============================================================
+# HyperRAG API Configuration
+# ============================================================
+# Copy this file to config.yaml and fill in your API key:
+#   cp config.yaml.example config.yaml
+
+# ZenMux API Settings
+# Register and get your API key at: https://zenmux.ai/invite/GBQMC5
+api:
+  base_url: "https://zenmux.ai/api/v1"
+  api_key: "sk-your-api-key-here"
+
+# Model Configuration
+models:
+  # OCR vision model (used for document parsing)
+  ocr_model: "openai/gpt-5.2-chat"
+  # Agent model (used for audit reasoning and entity extraction)
+  agent_model: "anthropic/claude-sonnet-4"
+
+# Parser Settings
+parser:
+  dpi: 150
+  jpeg_quality: 75
+  max_tokens: 4096
+
+# ChromaDB Settings
+vectordb:
+  persist_dir: "data/chroma_db"
+  collection_name: "hyperrag_docs"
+
+# Agent Settings
+agent:
+  max_iterations: 10
+
+# Data Directories
+paths:
+  upload_dir: "data/uploads"
+  parsed_dir: "data/parsed"
+  highlighted_dir: "data/highlighted"
+  prompts_dir: "prompts"

@@ -1,0 +1,12 @@
+.env
+config.yaml
+__pycache__/
+*.pyc
+data/uploads/
+data/parsed/
+data/highlighted/
+data/chroma_db/
+.venv/
+*.egg-info/
+dist/
+build/
