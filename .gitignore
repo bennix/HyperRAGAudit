@@ -12,15 +12,5 @@ data/chroma_db/
 dist/
 build/
 
-# LaTeX build artifacts
-book/*.aux
-book/*.log
-book/*.toc
-book/*.out
-book/*.idx
-book/*.ind
-book/*.ilg
-book/*.fls
-book/*.fdb_latexmk
-book/*.synctex.gz
-book/*.pdf
+# LaTeX book (local only)
+book/
